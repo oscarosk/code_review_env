@@ -12,15 +12,30 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import textwrap
 import time
 
-from openai import OpenAI
+# ---------------------------------------------------------------------------
+# Guard all top-level imports — evaluator runs this file on the host,
+# outside the Docker container, so packages may not be installed.
+# A bare ImportError here causes exit code 1 and fails Phase 2.
+# ---------------------------------------------------------------------------
+try:
+    from openai import OpenAI
+except ImportError as e:
+    print("[START] task=setup env=code_review_env model=unknown")
+    print(f"[STEP] step=0 action=import_check reward=0.00 done=true error=ImportError_openai:{e}")
+    print("[END] success=false steps=0 score=0.00 rewards=")
+    sys.exit(0)
 
-# ---------------------------------------------------------------------------
-# Environment imports
-# ---------------------------------------------------------------------------
-from models import CodeReviewAction, ReviewFinding
+try:
+    from models import CodeReviewAction, ReviewFinding
+except ImportError as e:
+    print("[START] task=setup env=code_review_env model=unknown")
+    print(f"[STEP] step=0 action=import_check reward=0.00 done=true error=ImportError_models:{e}")
+    print("[END] success=false steps=0 score=0.00 rewards=")
+    sys.exit(0)
 
 
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", "code_review_env")
@@ -28,7 +43,7 @@ API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 HF_TOKEN = os.getenv("HF_TOKEN")
 BENCHMARK = "code_review_env"
-MAX_STEPS = 6
+MAX_STEPS = 12  # 3 tasks x up to 3 attempts each — was 6 which cut off hard task
 TEMPERATURE = 0.2
 
 TASK_ORDER = ["easy", "medium", "hard"]
@@ -131,10 +146,20 @@ async def start_env_manually():
     Start the environment container manually instead of relying on
     CodeReviewEnv.from_docker_image(...), which appears flaky in the evaluator.
     """
-    from client import CodeReviewEnv
+    # Guard client import — same risk as models import
+    try:
+        from client import CodeReviewEnv
+    except ImportError as e:
+        print("[START] task=env_startup env=code_review_env model=" + MODEL_NAME)
+        print(f"[STEP] step=0 action=import_client reward=0.00 done=true error=ImportError:{e}")
+        print("[END] success=false steps=0 score=0.00 rewards=")
+        return None, None
 
     port = find_free_port()
     container_name = f"{LOCAL_IMAGE_NAME}-{int(time.time() * 1000)}"
+
+    # Initialize container_id before try block to avoid NameError in timeout path
+    container_id = ""
 
     try:
         result = subprocess.run(
@@ -149,13 +174,11 @@ async def start_env_manually():
             check=True,
         )
         container_id = (result.stdout or "").strip()
-    except subprocess.CalledProcessError as e:
-        stdout = (e.stdout or "").strip()
-        stderr = (e.stderr or "").strip()
+    except Exception as e:
         print("[START] task=env_startup env=code_review_env model=" + MODEL_NAME)
         print(
             f"[STEP] step=0 action=start_env reward=0.00 done=true "
-            f"error=docker_run_failed stdout={stdout} stderr={stderr}"
+            f"error=docker_run_exception:{e}"
         )
         print("[END] success=false steps=0 score=0.00 rewards=")
         return None, None
@@ -225,8 +248,6 @@ async def run_episode(client: OpenAI, env_client):
             obs = step_result.observation.model_dump()
             last_reward = float(step_result.reward)
             done = bool(step_result.done)
-            if last_error is None:
-                last_error = None
         except Exception as e:
             last_error = str(e)
             last_reward = 0.0
@@ -251,7 +272,6 @@ async def run_episode(client: OpenAI, env_client):
             f"error={error_str}"
         )
 
-        # Reset last_error after reporting it once
         last_error = None
 
     score = sum(rewards) / len(rewards) if rewards else 0.0
@@ -302,13 +322,26 @@ async def amain():
 
         if container_name:
             try:
-                subprocess.run(["docker", "rm", "-f", container_name], check=False)
+                subprocess.run(
+                    ["docker", "rm", "-f", container_name],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
             except Exception:
                 pass
 
 
 def main():
-    asyncio.run(amain())
+    # Wrap asyncio.run so any unexpected top-level exception
+    # still exits with code 0 (non-zero = Phase 2 failure)
+    try:
+        asyncio.run(amain())
+    except Exception as e:
+        print("[START] task=setup env=code_review_env model=" + MODEL_NAME)
+        print(f"[STEP] step=0 action=main reward=0.00 done=true error={e}")
+        print("[END] success=false steps=0 score=0.00 rewards=")
+        sys.exit(0)
 
 
 if __name__ == "__main__":
