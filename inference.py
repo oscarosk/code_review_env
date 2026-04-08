@@ -72,6 +72,9 @@ def build_user_prompt(obs: dict) -> str:
 
 def parse_llm_response(text: str) -> CodeReviewAction:
     """Parse LLM JSON response into CodeReviewAction."""
+    if not isinstance(text, str):
+        return CodeReviewAction(findings=[], review_summary="Invalid non-string response")
+
     # Strip markdown fences if present
     cleaned = text.strip()
     if cleaned.startswith("```"):
@@ -142,7 +145,7 @@ async def run_episode(client: OpenAI, env_client):
                 temperature=TEMPERATURE,
                 max_tokens=600,
             )
-            llm_text = response.choices[0].message.content
+            llm_text = response.choices[0].message.content or '{"findings": [], "review_summary": "Empty response"}'
             conversation.append({"role": "assistant", "content": llm_text})
             conversation = [conversation[0], conversation[-2], conversation[-1]]
         except Exception as e:
@@ -187,7 +190,7 @@ async def run_episode(client: OpenAI, env_client):
     # Compute final score
     score = sum(rewards) / len(rewards) if rewards else 0.0
     score = min(1.0, max(0.0, score))
-    success = score > 0.3
+    success = score >= 0.3
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
 
     print(
@@ -198,21 +201,40 @@ async def run_episode(client: OpenAI, env_client):
 
 
 async def amain():
-
-    if not HF_TOKEN:
-        raise ValueError("HF_TOKEN environment variable is required")
-    # Initialize OpenAI client
-    client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
-
-    # Initialize environment client
-    from client import CodeReviewEnv
-    env_client = await CodeReviewEnv.from_docker_image(LOCAL_IMAGE_NAME)
+    env_client = None
 
     try:
-        score = await run_episode(client, env_client)
-        print(f"\nFinal score: {score:.2f}")
+        if not HF_TOKEN:
+            print("[START] task=setup env=code_review_env model=" + MODEL_NAME)
+            print("[STEP] step=0 action=check_env reward=0.00 done=true error=Missing HF_TOKEN environment variable")
+            print("[END] success=false steps=0 score=0.00 rewards=")
+            return
+
+        client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
+
+        from client import CodeReviewEnv
+
+        try:
+            env_client = await CodeReviewEnv.from_docker_image(LOCAL_IMAGE_NAME)
+        except Exception as e:
+            print("[START] task=env_startup env=code_review_env model=" + MODEL_NAME)
+            print(f"[STEP] step=0 action=start_env reward=0.00 done=true error={str(e)}")
+            print("[END] success=false steps=0 score=0.00 rewards=")
+            return
+
+        try:
+            score = await run_episode(client, env_client)
+            print(f"\nFinal score: {score:.2f}")
+        except Exception as e:
+            print(f"[STEP] step=0 action=run_episode reward=0.00 done=true error={str(e)}")
+            print("[END] success=false steps=0 score=0.00 rewards=")
+
     finally:
-        await env_client.close()
+        if env_client is not None:
+            try:
+                await env_client.close()
+            except Exception:
+                pass
 
 
 def main():
