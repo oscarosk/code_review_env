@@ -12,12 +12,11 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import textwrap
 import time
+import urllib.request
 
-# ---------------------------------------------------------------------------
-# Guard top-level imports so host-side evaluator doesn't fail immediately
-# ---------------------------------------------------------------------------
 try:
     from openai import OpenAI
 except ImportError as e:
@@ -35,7 +34,6 @@ except ImportError as e:
     raise SystemExit(0)
 
 
-LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", "code_review_env")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 HF_TOKEN = os.getenv("HF_TOKEN")
@@ -133,7 +131,15 @@ def find_free_port() -> int:
         return sock.getsockname()[1]
 
 
-async def start_env_manually():
+def healthcheck(base_url: str) -> bool:
+    try:
+        with urllib.request.urlopen(f"{base_url}/health", timeout=2) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+async def start_env_locally():
     try:
         from client import CodeReviewEnv
     except ImportError as e:
@@ -143,60 +149,53 @@ async def start_env_manually():
         return None, None
 
     port = find_free_port()
-    container_name = f"{LOCAL_IMAGE_NAME}-{int(time.time() * 1000)}"
-    container_id = ""
+    base_url = f"http://127.0.0.1:{port}"
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.getcwd() + os.pathsep + env.get("PYTHONPATH", "")
 
     try:
-        result = subprocess.run(
+        server_proc = subprocess.Popen(
             [
-                "docker", "run", "-d",
-                "--name", container_name,
-                "-p", f"{port}:8000",
-                LOCAL_IMAGE_NAME,
+                sys.executable,
+                "-m",
+                "uvicorn",
+                "server.app:app",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
             ],
-            capture_output=True,
-            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
         )
     except Exception as e:
         print("[START] task=env_startup env=code_review_env model=" + MODEL_NAME)
-        print(
-            f"[STEP] step=0 action=start_env reward=0.00 done=true "
-            f"error=docker_run_exception:{e}"
-        )
+        print(f"[STEP] step=0 action=start_local_server reward=0.00 done=true error={e}")
         print("[END] success=false steps=0 score=0.00 rewards=")
         return None, None
 
-    container_id = (result.stdout or "").strip()
-    if result.returncode != 0:
-        stdout = (result.stdout or "").strip()
-        stderr = (result.stderr or "").strip()
-        print("[START] task=env_startup env=code_review_env model=" + MODEL_NAME)
-        print(
-            f"[STEP] step=0 action=start_env reward=0.00 done=true "
-            f"error=docker_run_failed returncode={result.returncode} stdout={stdout} stderr={stderr}"
-        )
-        print("[END] success=false steps=0 score=0.00 rewards=")
-        return None, None
-
-    base_url = f"http://127.0.0.1:{port}"
     last_error = None
-
     for _ in range(30):
+        if server_proc.poll() is not None:
+            print("[START] task=env_startup env=code_review_env model=" + MODEL_NAME)
+            print("[STEP] step=0 action=start_local_server reward=0.00 done=true error=server_process_exited_early")
+            print("[END] success=false steps=0 score=0.00 rewards=")
+            return None, server_proc
         try:
-            env_client = CodeReviewEnv(base_url=base_url)
-            await env_client.reset()
-            return env_client, container_name
+            if healthcheck(base_url):
+                env_client = CodeReviewEnv(base_url=base_url)
+                await env_client.reset()
+                return env_client, server_proc
         except Exception as e:
             last_error = str(e)
-            await asyncio.sleep(1)
+        await asyncio.sleep(1)
 
     print("[START] task=env_startup env=code_review_env model=" + MODEL_NAME)
-    print(
-        f"[STEP] step=0 action=wait_env reward=0.00 done=true "
-        f"error=env_not_ready container_id={container_id} last_error={last_error}"
-    )
+    print(f"[STEP] step=0 action=wait_env reward=0.00 done=true error=env_not_ready last_error={last_error}")
     print("[END] success=false steps=0 score=0.00 rewards=")
-    return None, container_name
+    return None, server_proc
 
 
 async def run_episode(client: OpenAI, env_client):
@@ -281,21 +280,18 @@ async def run_episode(client: OpenAI, env_client):
 
 async def amain():
     env_client = None
-    container_name = None
+    server_proc = None
 
     try:
         if not HF_TOKEN:
             print("[START] task=setup env=code_review_env model=" + MODEL_NAME)
-            print(
-                "[STEP] step=0 action=check_env reward=0.00 done=true "
-                "error=Missing HF_TOKEN environment variable"
-            )
+            print("[STEP] step=0 action=check_env reward=0.00 done=true error=Missing HF_TOKEN environment variable")
             print("[END] success=false steps=0 score=0.00 rewards=")
             return
 
         client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
 
-        env_client, container_name = await start_env_manually()
+        env_client, server_proc = await start_env_locally()
         if env_client is None:
             return
 
@@ -313,16 +309,15 @@ async def amain():
             except Exception:
                 pass
 
-        if container_name:
+        if server_proc is not None:
             try:
-                subprocess.run(
-                    ["docker", "rm", "-f", container_name],
-                    check=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+                server_proc.terminate()
+                server_proc.wait(timeout=5)
             except Exception:
-                pass
+                try:
+                    server_proc.kill()
+                except Exception:
+                    pass
 
 
 def main():
@@ -332,7 +327,6 @@ def main():
         print("[START] task=setup env=code_review_env model=" + MODEL_NAME)
         print(f"[STEP] step=0 action=main reward=0.00 done=true error={e}")
         print("[END] success=false steps=0 score=0.00 rewards=")
-        return
 
 
 if __name__ == "__main__":
