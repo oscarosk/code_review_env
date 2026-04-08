@@ -1,0 +1,29 @@
+spec_version: 1
+name: code_review_env
+type: space
+runtime: fastapi
+app: server.app:app
+port: 8000
+description: >
+  Code Review RL Environment - An AI agent reviews Python code for bugs, logic
+  errors, and security vulnerabilities across 3 difficulty levels with rich
+  partial rewards for correct identification, accurate line numbers, and
+  actionable fix suggestions.
+tags:
+  - openenv
+  - code-review
+  - security
+  - software-engineering
+tasks:
+  - id: easy_bugs
+    name: Find Obvious Bugs
+    difficulty: easy
+    description: Catch undefined variables, off-by-one errors, missing returns
+  - id: medium_logic
+    name: Find Logic Errors
+    difficulty: medium
+    description: Identify incorrect algorithms, bad edge case handling, flawed conditionals
+  - id: hard_security
+    name: Find Security Vulnerabilities
+    difficulty: hard
+    description: Detect SQL injection, XSS, path traversal, command injection, insecure deserialization
