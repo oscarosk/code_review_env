@@ -1,2 +1,0 @@
-[console_scripts]
-server = code_review_env.server.app:main
