@@ -10,7 +10,10 @@ MANDATORY:
 import asyncio
 import json
 import os
+import socket
+import subprocess
 import textwrap
+import time
 
 from openai import OpenAI
 
@@ -65,7 +68,9 @@ def build_user_prompt(obs: dict) -> str:
     parts.append(f"Number of issues to find: {obs.get('num_known_issues', 0)}")
     if obs.get("feedback"):
         parts.append(f"\nFeedback from previous attempt:\n{obs['feedback']}")
-    parts.append(f"\nCode to review ({obs.get('language', 'python')}):\n```\n{obs.get('code_to_review', '')}\n```")
+    parts.append(
+        f"\nCode to review ({obs.get('language', 'python')}):\n```\n{obs.get('code_to_review', '')}\n```"
+    )
     parts.append("\nRespond with ONLY the JSON object containing your findings.")
     return "\n".join(parts)
 
@@ -75,17 +80,15 @@ def parse_llm_response(text: str) -> CodeReviewAction:
     if not isinstance(text, str):
         return CodeReviewAction(findings=[], review_summary="Invalid non-string response")
 
-    # Strip markdown fences if present
     cleaned = text.strip()
     if cleaned.startswith("```"):
         lines = cleaned.split("\n")
-        lines = [l for l in lines if not l.strip().startswith("```")]
+        lines = [line for line in lines if not line.strip().startswith("```")]
         cleaned = "\n".join(lines)
 
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError:
-        # Try to extract JSON from the response
         start = cleaned.find("{")
         end = cleaned.rfind("}") + 1
         if start >= 0 and end > start:
@@ -97,14 +100,16 @@ def parse_llm_response(text: str) -> CodeReviewAction:
             return CodeReviewAction(findings=[], review_summary="Failed to parse response")
 
     findings = []
-    for f in data.get("findings", []):
+    for finding in data.get("findings", []):
         try:
-            findings.append(ReviewFinding(
-                line_number=int(f.get("line_number", 0)),
-                issue_type=f.get("issue_type", "bug"),
-                description=f.get("description", ""),
-                suggested_fix=f.get("suggested_fix", ""),
-            ))
+            findings.append(
+                ReviewFinding(
+                    line_number=int(finding.get("line_number", 0)),
+                    issue_type=finding.get("issue_type", "bug"),
+                    description=finding.get("description", ""),
+                    suggested_fix=finding.get("suggested_fix", ""),
+                )
+            )
         except Exception:
             continue
 
@@ -114,15 +119,76 @@ def parse_llm_response(text: str) -> CodeReviewAction:
     )
 
 
+def find_free_port() -> int:
+    """Find a free localhost port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+async def start_env_manually():
+    """
+    Start the environment container manually instead of relying on
+    CodeReviewEnv.from_docker_image(...), which appears flaky in the evaluator.
+    """
+    from client import CodeReviewEnv
+
+    port = find_free_port()
+    container_name = f"{LOCAL_IMAGE_NAME}-{int(time.time() * 1000)}"
+
+    try:
+        result = subprocess.run(
+            [
+                "docker", "run", "-d",
+                "--name", container_name,
+                "-p", f"{port}:8000",
+                LOCAL_IMAGE_NAME,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        container_id = (result.stdout or "").strip()
+    except subprocess.CalledProcessError as e:
+        stdout = (e.stdout or "").strip()
+        stderr = (e.stderr or "").strip()
+        print("[START] task=env_startup env=code_review_env model=" + MODEL_NAME)
+        print(
+            f"[STEP] step=0 action=start_env reward=0.00 done=true "
+            f"error=docker_run_failed stdout={stdout} stderr={stderr}"
+        )
+        print("[END] success=false steps=0 score=0.00 rewards=")
+        return None, None
+
+    base_url = f"http://127.0.0.1:{port}"
+
+    # Wait for the API to become ready
+    last_error = None
+    for _ in range(30):
+        try:
+            env_client = CodeReviewEnv(base_url=base_url)
+            await env_client.reset()
+            return env_client, container_name
+        except Exception as e:
+            last_error = str(e)
+            await asyncio.sleep(1)
+
+    print("[START] task=env_startup env=code_review_env model=" + MODEL_NAME)
+    print(
+        f"[STEP] step=0 action=wait_env reward=0.00 done=true "
+        f"error=env_not_ready container_id={container_id} last_error={last_error}"
+    )
+    print("[END] success=false steps=0 score=0.00 rewards=")
+    return None, container_name
+
+
 async def run_episode(client: OpenAI, env_client):
     """Run a single episode across all tasks."""
-    # Reset environment
     reset_result = await env_client.reset()
     obs = reset_result.observation.model_dump()
 
     step_num = 0
     rewards = []
-    last_reward = 0.0
     done = False
     last_error = None
     conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -133,11 +199,9 @@ async def run_episode(client: OpenAI, env_client):
     print(f"[START] task={current_task} env={BENCHMARK} model={MODEL_NAME}")
 
     while not done and step_num < MAX_STEPS:
-        # Build prompt
         user_msg = build_user_prompt(obs)
         conversation.append({"role": "user", "content": user_msg})
 
-        # Call LLM
         try:
             response = client.chat.completions.create(
                 model=MODEL_NAME,
@@ -145,23 +209,24 @@ async def run_episode(client: OpenAI, env_client):
                 temperature=TEMPERATURE,
                 max_tokens=600,
             )
-            llm_text = response.choices[0].message.content or '{"findings": [], "review_summary": "Empty response"}'
+            llm_text = response.choices[0].message.content or (
+                '{"findings": [], "review_summary": "Empty response"}'
+            )
             conversation.append({"role": "assistant", "content": llm_text})
             conversation = [conversation[0], conversation[-2], conversation[-1]]
         except Exception as e:
             last_error = str(e)
             llm_text = '{"findings": [], "review_summary": "Error"}'
 
-        # Parse response into action
         action = parse_llm_response(llm_text)
 
-        # Step environment
         try:
             step_result = await env_client.step(action)
             obs = step_result.observation.model_dump()
             last_reward = float(step_result.reward)
             done = bool(step_result.done)
-            last_error = None
+            if last_error is None:
+                last_error = None
         except Exception as e:
             last_error = str(e)
             last_reward = 0.0
@@ -170,7 +235,6 @@ async def run_episode(client: OpenAI, env_client):
         step_num += 1
         rewards.append(last_reward)
 
-        # Detect task transition
         new_task_id = obs.get("task_id", "")
         if new_task_id == "done":
             current_task = "all_tasks"
@@ -187,11 +251,13 @@ async def run_episode(client: OpenAI, env_client):
             f"error={error_str}"
         )
 
-    # Compute final score
+        # Reset last_error after reporting it once
+        last_error = None
+
     score = sum(rewards) / len(rewards) if rewards else 0.0
     score = min(1.0, max(0.0, score))
     success = score >= 0.3
-    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    rewards_str = ",".join(f"{reward:.2f}" for reward in rewards)
 
     print(
         f"[END] success={'true' if success else 'false'} steps={step_num} "
@@ -202,24 +268,22 @@ async def run_episode(client: OpenAI, env_client):
 
 async def amain():
     env_client = None
+    container_name = None
 
     try:
         if not HF_TOKEN:
             print("[START] task=setup env=code_review_env model=" + MODEL_NAME)
-            print("[STEP] step=0 action=check_env reward=0.00 done=true error=Missing HF_TOKEN environment variable")
+            print(
+                "[STEP] step=0 action=check_env reward=0.00 done=true "
+                "error=Missing HF_TOKEN environment variable"
+            )
             print("[END] success=false steps=0 score=0.00 rewards=")
             return
 
         client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
 
-        from client import CodeReviewEnv
-
-        try:
-            env_client = await CodeReviewEnv.from_docker_image(LOCAL_IMAGE_NAME)
-        except Exception as e:
-            print("[START] task=env_startup env=code_review_env model=" + MODEL_NAME)
-            print(f"[STEP] step=0 action=start_env reward=0.00 done=true error={str(e)}")
-            print("[END] success=false steps=0 score=0.00 rewards=")
+        env_client, container_name = await start_env_manually()
+        if env_client is None:
             return
 
         try:
@@ -233,6 +297,12 @@ async def amain():
         if env_client is not None:
             try:
                 await env_client.close()
+            except Exception:
+                pass
+
+        if container_name:
+            try:
+                subprocess.run(["docker", "rm", "-f", container_name], check=False)
             except Exception:
                 pass
 
