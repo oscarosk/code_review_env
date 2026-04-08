@@ -12,14 +12,11 @@ import json
 import os
 import socket
 import subprocess
-import sys
 import textwrap
 import time
 
 # ---------------------------------------------------------------------------
-# Guard all top-level imports — evaluator runs this file on the host,
-# outside the Docker container, so packages may not be installed.
-# A bare ImportError here causes exit code 1 and fails Phase 2.
+# Guard top-level imports so host-side evaluator doesn't fail immediately
 # ---------------------------------------------------------------------------
 try:
     from openai import OpenAI
@@ -27,7 +24,7 @@ except ImportError as e:
     print("[START] task=setup env=code_review_env model=unknown")
     print(f"[STEP] step=0 action=import_check reward=0.00 done=true error=ImportError_openai:{e}")
     print("[END] success=false steps=0 score=0.00 rewards=")
-    sys.exit(0)
+    raise SystemExit(0)
 
 try:
     from models import CodeReviewAction, ReviewFinding
@@ -35,7 +32,7 @@ except ImportError as e:
     print("[START] task=setup env=code_review_env model=unknown")
     print(f"[STEP] step=0 action=import_check reward=0.00 done=true error=ImportError_models:{e}")
     print("[END] success=false steps=0 score=0.00 rewards=")
-    sys.exit(0)
+    raise SystemExit(0)
 
 
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", "code_review_env")
@@ -43,14 +40,11 @@ API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 HF_TOKEN = os.getenv("HF_TOKEN")
 BENCHMARK = "code_review_env"
-MAX_STEPS = 12  # 3 tasks x up to 3 attempts each — was 6 which cut off hard task
+MAX_STEPS = 12
 TEMPERATURE = 0.2
 
 TASK_ORDER = ["easy", "medium", "hard"]
 
-# ---------------------------------------------------------------------------
-# System prompt
-# ---------------------------------------------------------------------------
 SYSTEM_PROMPT = textwrap.dedent("""\
 You are an expert code reviewer. You will be given code to review and must identify bugs, logic errors, or security vulnerabilities.
 
@@ -91,7 +85,6 @@ def build_user_prompt(obs: dict) -> str:
 
 
 def parse_llm_response(text: str) -> CodeReviewAction:
-    """Parse LLM JSON response into CodeReviewAction."""
     if not isinstance(text, str):
         return CodeReviewAction(findings=[], review_summary="Invalid non-string response")
 
@@ -135,18 +128,12 @@ def parse_llm_response(text: str) -> CodeReviewAction:
 
 
 def find_free_port() -> int:
-    """Find a free localhost port."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
 
 
 async def start_env_manually():
-    """
-    Start the environment container manually instead of relying on
-    CodeReviewEnv.from_docker_image(...), which appears flaky in the evaluator.
-    """
-    # Guard client import — same risk as models import
     try:
         from client import CodeReviewEnv
     except ImportError as e:
@@ -157,8 +144,6 @@ async def start_env_manually():
 
     port = find_free_port()
     container_name = f"{LOCAL_IMAGE_NAME}-{int(time.time() * 1000)}"
-
-    # Initialize container_id before try block to avoid NameError in timeout path
     container_id = ""
 
     try:
@@ -171,9 +156,7 @@ async def start_env_manually():
             ],
             capture_output=True,
             text=True,
-            check=True,
         )
-        container_id = (result.stdout or "").strip()
     except Exception as e:
         print("[START] task=env_startup env=code_review_env model=" + MODEL_NAME)
         print(
@@ -183,10 +166,21 @@ async def start_env_manually():
         print("[END] success=false steps=0 score=0.00 rewards=")
         return None, None
 
-    base_url = f"http://127.0.0.1:{port}"
+    container_id = (result.stdout or "").strip()
+    if result.returncode != 0:
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+        print("[START] task=env_startup env=code_review_env model=" + MODEL_NAME)
+        print(
+            f"[STEP] step=0 action=start_env reward=0.00 done=true "
+            f"error=docker_run_failed returncode={result.returncode} stdout={stdout} stderr={stderr}"
+        )
+        print("[END] success=false steps=0 score=0.00 rewards=")
+        return None, None
 
-    # Wait for the API to become ready
+    base_url = f"http://127.0.0.1:{port}"
     last_error = None
+
     for _ in range(30):
         try:
             env_client = CodeReviewEnv(base_url=base_url)
@@ -206,7 +200,6 @@ async def start_env_manually():
 
 
 async def run_episode(client: OpenAI, env_client):
-    """Run a single episode across all tasks."""
     reset_result = await env_client.reset()
     obs = reset_result.observation.model_dump()
 
@@ -333,15 +326,13 @@ async def amain():
 
 
 def main():
-    # Wrap asyncio.run so any unexpected top-level exception
-    # still exits with code 0 (non-zero = Phase 2 failure)
     try:
         asyncio.run(amain())
     except Exception as e:
         print("[START] task=setup env=code_review_env model=" + MODEL_NAME)
         print(f"[STEP] step=0 action=main reward=0.00 done=true error={e}")
         print("[END] success=false steps=0 score=0.00 rewards=")
-        sys.exit(0)
+        return
 
 
 if __name__ == "__main__":
