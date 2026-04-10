@@ -7,42 +7,47 @@ MANDATORY:
 - Emits [START], [STEP], [END] stdout format.
 """
 
-import asyncio
 import json
 import os
-import socket
-import subprocess
 import sys
 import textwrap
-import time
-import urllib.request
 
 try:
     from openai import OpenAI
-except ImportError as e:
+except ImportError:
     print("[START] task=setup env=code_review_env model=unknown")
-    print(f"[STEP] step=0 action=import_check reward=0.00 done=true error=ImportError_openai:{e}")
+    print("[STEP] step=0 action=import reward=0.00 done=true error=openai_not_installed")
     print("[END] success=false steps=0 score=0.00 rewards=")
-    raise SystemExit(0)
+    sys.exit(0)
 
 try:
-    from models import CodeReviewAction, ReviewFinding
-except ImportError as e:
-    print("[START] task=setup env=code_review_env model=unknown")
-    print(f"[STEP] step=0 action=import_check reward=0.00 done=true error=ImportError_models:{e}")
-    print("[END] success=false steps=0 score=0.00 rewards=")
-    raise SystemExit(0)
+    from models import CodeReviewAction, CodeReviewObservation, ReviewFinding
+    from server.code_review_env_environment import CodeReviewEnvironment, TASK_ORDER
+except ImportError:
+    try:
+        sys.path.insert(0, os.getcwd())
+        from models import CodeReviewAction, CodeReviewObservation, ReviewFinding
+        from server.code_review_env_environment import CodeReviewEnvironment, TASK_ORDER
+    except ImportError as e:
+        print("[START] task=setup env=code_review_env model=unknown")
+        print(f"[STEP] step=0 action=import reward=0.00 done=true error={e}")
+        print("[END] success=false steps=0 score=0.00 rewards=")
+        sys.exit(0)
 
-
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-HF_TOKEN = os.getenv("HF_TOKEN")
+HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+IMAGE_NAME = os.getenv("IMAGE_NAME", "code_review_env")
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", IMAGE_NAME)
 BENCHMARK = "code_review_env"
-MAX_STEPS = 12
 TEMPERATURE = 0.2
 
-TASK_ORDER = ["easy", "medium", "hard"]
-
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
 SYSTEM_PROMPT = textwrap.dedent("""\
 You are an expert code reviewer. You will be given code to review and must identify bugs, logic errors, or security vulnerabilities.
 
@@ -60,37 +65,39 @@ IMPORTANT: You must respond ONLY with valid JSON matching this exact schema:
 }
 
 Rules:
-- Report EVERY issue you can find
-- Be specific about line numbers
-- issue_type must be one of: bug, logic_error, security_vulnerability
-- Always provide a suggested_fix
-- Output ONLY the JSON, no markdown, no backticks, no explanation
+- Report EVERY issue you can find — the code has a known number of issues
+- Be precise about line numbers (count from line 1)
+- issue_type must be exactly one of: bug, logic_error, security_vulnerability
+- Always provide a suggested_fix with at least 10 characters
+- Output ONLY the JSON, no markdown fences, no backticks, no explanation before or after
 """)
 
 
-def build_user_prompt(obs: dict) -> str:
-    parts = []
-    parts.append(f"Task: {obs.get('task_description', '')}")
-    parts.append(f"Difficulty: {obs.get('difficulty', '')}")
-    parts.append(f"Number of issues to find: {obs.get('num_known_issues', 0)}")
-    if obs.get("feedback"):
-        parts.append(f"\nFeedback from previous attempt:\n{obs['feedback']}")
+def build_user_prompt(obs: CodeReviewObservation) -> str:
+    parts = [
+        f"Task: {obs.task_description}",
+        f"Difficulty: {obs.difficulty}",
+        f"Number of issues to find: {obs.num_known_issues}",
+    ]
+    if obs.feedback and "Review the code" not in obs.feedback:
+        parts.append(f"\nFeedback from previous attempt:\n{obs.feedback}")
     parts.append(
-        f"\nCode to review ({obs.get('language', 'python')}):\n```\n{obs.get('code_to_review', '')}\n```"
+        f"\nCode to review ({obs.language}):\n```\n{obs.code_to_review}\n```"
     )
-    parts.append("\nRespond with ONLY the JSON object containing your findings.")
+    parts.append(f"\nFind exactly {obs.num_known_issues} issues. Respond with ONLY valid JSON.")
     return "\n".join(parts)
 
 
 def parse_llm_response(text: str) -> CodeReviewAction:
-    if not isinstance(text, str):
-        return CodeReviewAction(findings=[], review_summary="Invalid non-string response")
+    if not isinstance(text, str) or not text.strip():
+        return CodeReviewAction(findings=[], review_summary="Empty response")
 
     cleaned = text.strip()
-    if cleaned.startswith("```"):
+    # Strip markdown fences
+    if "```" in cleaned:
         lines = cleaned.split("\n")
-        lines = [line for line in lines if not line.strip().startswith("```")]
-        cleaned = "\n".join(lines)
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        cleaned = "\n".join(lines).strip()
 
     try:
         data = json.loads(cleaned)
@@ -101,175 +108,90 @@ def parse_llm_response(text: str) -> CodeReviewAction:
             try:
                 data = json.loads(cleaned[start:end])
             except json.JSONDecodeError:
-                return CodeReviewAction(findings=[], review_summary="Failed to parse response")
+                return CodeReviewAction(findings=[], review_summary="Parse failed")
         else:
-            return CodeReviewAction(findings=[], review_summary="Failed to parse response")
+            return CodeReviewAction(findings=[], review_summary="Parse failed")
 
     findings = []
-    for finding in data.get("findings", []):
+    for f in data.get("findings", []):
         try:
-            findings.append(
-                ReviewFinding(
-                    line_number=int(finding.get("line_number", 0)),
-                    issue_type=finding.get("issue_type", "bug"),
-                    description=finding.get("description", ""),
-                    suggested_fix=finding.get("suggested_fix", ""),
-                )
-            )
+            findings.append(ReviewFinding(
+                line_number=int(f.get("line_number", 0)),
+                issue_type=str(f.get("issue_type", "bug")),
+                description=str(f.get("description", "")),
+                suggested_fix=str(f.get("suggested_fix", "")),
+            ))
         except Exception:
             continue
 
     return CodeReviewAction(
         findings=findings,
-        review_summary=data.get("review_summary", ""),
+        review_summary=str(data.get("review_summary", "")),
     )
 
 
-def find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+def run_task(client: OpenAI, task_name: str) -> float:
+    """Run one task (one episode): reset → LLM review → step → score."""
 
+    # Set the task via env var and create environment
+    os.environ["CURRENT_TASK"] = task_name
+    env = CodeReviewEnvironment()
+    obs = env.reset()
 
-def healthcheck(base_url: str) -> bool:
-    try:
-        with urllib.request.urlopen(f"{base_url}/health", timeout=2) as resp:
-            return resp.status == 200
-    except Exception:
-        return False
-
-
-async def start_env_locally():
-    try:
-        from client import CodeReviewEnv
-    except ImportError as e:
-        print("[START] task=env_startup env=code_review_env model=" + MODEL_NAME)
-        print(f"[STEP] step=0 action=import_client reward=0.00 done=true error=ImportError:{e}")
-        print("[END] success=false steps=0 score=0.00 rewards=")
-        return None, None
-
-    port = find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
-
-    env = os.environ.copy()
-    env["PYTHONPATH"] = os.getcwd() + os.pathsep + env.get("PYTHONPATH", "")
-
-    try:
-        server_proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "uvicorn",
-                "server.app:app",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=env,
-        )
-    except Exception as e:
-        print("[START] task=env_startup env=code_review_env model=" + MODEL_NAME)
-        print(f"[STEP] step=0 action=start_local_server reward=0.00 done=true error={e}")
-        print("[END] success=false steps=0 score=0.00 rewards=")
-        return None, None
-
-    last_error = None
-    for _ in range(30):
-        if server_proc.poll() is not None:
-            print("[START] task=env_startup env=code_review_env model=" + MODEL_NAME)
-            print("[STEP] step=0 action=start_local_server reward=0.00 done=true error=server_process_exited_early")
-            print("[END] success=false steps=0 score=0.00 rewards=")
-            return None, server_proc
-        try:
-            if healthcheck(base_url):
-                env_client = CodeReviewEnv(base_url=base_url)
-                await env_client.reset()
-                return env_client, server_proc
-        except Exception as e:
-            last_error = str(e)
-        await asyncio.sleep(1)
-
-    print("[START] task=env_startup env=code_review_env model=" + MODEL_NAME)
-    print(f"[STEP] step=0 action=wait_env reward=0.00 done=true error=env_not_ready last_error={last_error}")
-    print("[END] success=false steps=0 score=0.00 rewards=")
-    return None, server_proc
-
-
-async def run_episode(client: OpenAI, env_client):
-    reset_result = await env_client.reset()
-    obs = reset_result.observation.model_dump()
+    print(f"[START] task={task_name} env={BENCHMARK} model={MODEL_NAME}")
 
     step_num = 0
     rewards = []
-    done = False
+
+    # Build prompt from observation
+    user_msg = build_user_prompt(obs)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_msg},
+    ]
+
+    # Call LLM
     last_error = None
-    conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-    task_idx = 0
-    current_task = TASK_ORDER[task_idx] if task_idx < len(TASK_ORDER) else "done"
-
-    print(f"[START] task={current_task} env={BENCHMARK} model={MODEL_NAME}")
-
-    while not done and step_num < MAX_STEPS:
-        user_msg = build_user_prompt(obs)
-        conversation.append({"role": "user", "content": user_msg})
-
-        try:
-            response = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=conversation,
-                temperature=TEMPERATURE,
-                max_tokens=600,
-            )
-            llm_text = response.choices[0].message.content or (
-                '{"findings": [], "review_summary": "Empty response"}'
-            )
-            conversation.append({"role": "assistant", "content": llm_text})
-            conversation = [conversation[0], conversation[-2], conversation[-1]]
-        except Exception as e:
-            last_error = str(e)
-            llm_text = '{"findings": [], "review_summary": "Error"}'
-
-        action = parse_llm_response(llm_text)
-
-        try:
-            step_result = await env_client.step(action)
-            obs = step_result.observation.model_dump()
-            last_reward = float(step_result.reward)
-            done = bool(step_result.done)
-        except Exception as e:
-            last_error = str(e)
-            last_reward = 0.0
-            done = True
-
-        step_num += 1
-        rewards.append(last_reward)
-
-        new_task_id = obs.get("task_id", "")
-        if new_task_id == "done":
-            current_task = "all_tasks"
-        elif "medium" in new_task_id and current_task == "easy":
-            current_task = "medium"
-        elif "hard" in new_task_id and current_task in ("easy", "medium"):
-            current_task = "hard"
-
-        action_str = f"review({len(action.findings)}_findings)"
-        error_str = last_error if last_error else "null"
-        print(
-            f"[STEP] step={step_num} action={action_str} "
-            f"reward={last_reward:.2f} done={'true' if done else 'false'} "
-            f"error={error_str}"
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=messages,
+            temperature=TEMPERATURE,
+            max_tokens=2000,
         )
+        llm_text = response.choices[0].message.content or ""
+    except Exception as e:
+        last_error = str(e).replace("\n", " ")[:200]
+        llm_text = '{"findings": [], "review_summary": "LLM error"}'
 
-        last_error = None
+    # Parse into action
+    action = parse_llm_response(llm_text)
 
-    score = sum(rewards) / len(rewards) if rewards else 0.0
-    score = min(1.0, max(0.0, score))
+    # Step environment
+    try:
+        obs = env.step(action)
+        reward = float(obs.reward)
+        done = bool(obs.done)
+    except Exception as e:
+        last_error = str(e).replace("\n", " ")[:200]
+        reward = 0.0
+        done = True
+
+    step_num += 1
+    rewards.append(reward)
+
+    n_findings = len(action.findings)
+    error_str = last_error if last_error else "null"
+    print(
+        f"[STEP] step={step_num} action=review({n_findings}_findings) "
+        f"reward={reward:.2f} done={'true' if done else 'false'} "
+        f"error={error_str}"
+    )
+
+    # Score
+    score = max(0.0, min(1.0, reward))
     success = score >= 0.3
-    rewards_str = ",".join(f"{reward:.2f}" for reward in rewards)
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
 
     print(
         f"[END] success={'true' if success else 'false'} steps={step_num} "
@@ -278,54 +200,30 @@ async def run_episode(client: OpenAI, env_client):
     return score
 
 
-async def amain():
-    env_client = None
-    server_proc = None
-
+def main():
     try:
         if not HF_TOKEN:
-            print("[START] task=setup env=code_review_env model=" + MODEL_NAME)
-            print("[STEP] step=0 action=check_env reward=0.00 done=true error=Missing HF_TOKEN environment variable")
+            print(f"[START] task=setup env={BENCHMARK} model={MODEL_NAME}")
+            print("[STEP] step=0 action=check_token reward=0.00 done=true error=HF_TOKEN_not_set")
             print("[END] success=false steps=0 score=0.00 rewards=")
             return
 
         client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
 
-        env_client, server_proc = await start_env_locally()
-        if env_client is None:
-            return
+        scores = {}
+        for task_name in TASK_ORDER:
+            scores[task_name] = run_task(client, task_name)
 
-        try:
-            score = await run_episode(client, env_client)
-            print(f"\nFinal score: {score:.2f}")
-        except Exception as e:
-            print(f"[STEP] step=0 action=run_episode reward=0.00 done=true error={str(e)}")
-            print("[END] success=false steps=0 score=0.00 rewards=")
+        avg = sum(scores.values()) / len(scores)
+        print(f"\n=== Summary ===")
+        for t, s in scores.items():
+            print(f"  {t}: {s:.2f}")
+        print(f"  Average: {avg:.2f}")
 
-    finally:
-        if env_client is not None:
-            try:
-                await env_client.close()
-            except Exception:
-                pass
-
-        if server_proc is not None:
-            try:
-                server_proc.terminate()
-                server_proc.wait(timeout=5)
-            except Exception:
-                try:
-                    server_proc.kill()
-                except Exception:
-                    pass
-
-
-def main():
-    try:
-        asyncio.run(amain())
     except Exception as e:
-        print("[START] task=setup env=code_review_env model=" + MODEL_NAME)
-        print(f"[STEP] step=0 action=main reward=0.00 done=true error={e}")
+        err = str(e).replace("\n", " ")[:300]
+        print(f"[START] task=setup env={BENCHMARK} model={MODEL_NAME}")
+        print(f"[STEP] step=0 action=main reward=0.00 done=true error={err}")
         print("[END] success=false steps=0 score=0.00 rewards=")
 
 
