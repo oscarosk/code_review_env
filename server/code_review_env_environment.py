@@ -214,6 +214,7 @@ def load_session():
 
 LINE_TOLERANCE = 3
 
+EPS = 1e-6
 
 def _match_issue(finding, known):
     score = 0.0
@@ -256,7 +257,7 @@ def grade_review(findings, task_key):
     num_known = len(known_issues)
 
     if not findings:
-        return 0.0, "No findings submitted. The code has issues.", 0
+        return EPS, "No findings submitted. The code has issues.", 0
 
     used_known = set()
     used_findings = set()
@@ -284,7 +285,7 @@ def grade_review(findings, task_key):
 
     coverage_bonus = 0.1 if correct_count == num_known else 0.0
 
-    total_reward = max(0.0, min(1.0, issue_reward - fp_penalty + coverage_bonus))
+    total_reward = max(EPS, min(1.0 - EPS, issue_reward - fp_penalty + coverage_bonus))
 
     feedback_lines = [f"Found {correct_count}/{num_known} known issues."]
     for score, fi, ki, fb in matches:
